@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# equipe — uma equipe de agentes (Claude Code, Codex, DeepSeek) trabalhando num repositório git:
+# uma analista que escreve e revisa itens, implementadores que pegam itens em worktrees próprias,
+# um supervisor de limites e um painel web. Rode `equipe ajuda`.
+set -euo pipefail
+EQUIPE_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+LIB="$EQUIPE_HOME/lib"
+
+ajuda() {
+	cat <<'EOF'
+uso: equipe <comando> [argumentos]
+
+Começar
+  iniciar [--nome N]         prepara o repositório atual (.equipe/: config, projeto.md, fila)
+  info                       a configuração efetiva deste projeto
+  prompt <papel> [nome]      mostra o prompt montado (papel: analista | implementador)
+
+O dono
+  subir [N_CLAUDE=3 N_CODEX=3 N_DEEP=0 PRIMEIRO=1]
+                             sobe tudo: o app (se configurado), a analista, os implementadores,
+                             o painel e o supervisor
+  agentes <claudes> <codex> [analista 0|1] [primeiro]
+                             abre só os agentes pedidos (DEEP_N=N para DeepSeek)
+  painel                     painel web (tarefas, console de cada agente, mensagens, pausa)
+  supervisor [ver|plano|uma-vez|config …]
+                             sem argumento: liga o supervisor de limites em segundo plano
+  limites [--json | pode-pegar <nome>]
+                             quanto resta do Claude, do Codex e da DeepSeek
+  pausar ["motivo"] | retomar | pausa ver
+  parar [APP=1]              desliga a equipe com segurança, mostrando cada agente parando
+
+Os agentes (também usados pelo dono)
+  itens [STATUS | fila]      itens da fila
+  trava pegar|soltar <fila|integracao> <nome> | trava ver
+  msg <para> "texto" | msg ver [nome]
+  parada <nome> "passo" | parada <nome> parado "onde parou"
+  vivo <nome>                a sessão de um agente está rodando?
+  arvore ver | arvore resgatar <nome>
+  changelog <Seção> "texto (ID)"
+  compactar <nome> "foco"
+  recuperar                  conserta o git depois de uma queda de energia
+  limpar-worktrees [--apagar]
+  perguntas                  implementadores parados esperando resposta
+  roteiro <faxina|varredura|pesquisa>
+  faxina [--curto]           relatório da faxina (só lê)
+
+Manutenção do motor
+  teste                      roda os testes unitários do equipe-agentes
+EOF
+}
+
+cmd="${1:-ajuda}"
+[[ $# -gt 0 ]] && shift
+
+# Comandos que funcionam sem projeto.
+case "$cmd" in
+ajuda | -h | --help | help) ajuda; exit 0 ;;
+iniciar) exec python3 "$LIB/iniciar.py" "$@" ;;
+teste) cd "$EQUIPE_HOME" && exec python3 -m unittest discover -s testes -t . "$@" ;;
+esac
+
+# O resto precisa do projeto: carrega a configuração uma vez (e falha com uma mensagem clara).
+source "$LIB/comum.sh"
+
+servico_supervisor() {
+	if ! python3 "$LIB/supervisor.py" ver | head -1 | grep -q rodando; then
+		setsid nohup python3 "$LIB/supervisor.py" rodar >>"$ESTADO/supervisor.saida" 2>&1 </dev/null &
+		sleep 1
+	fi
+	python3 "$LIB/supervisor.py" ver | head -1
+}
+
+case "$cmd" in
+info) python3 "$LIB/config.py" ver ;;
+prompt) python3 "$LIB/prompt.py" "${1:?papel: analista | implementador}" "${2:-${1/implementador/claude-1}}" ;;
+subir)
+	for a in "$@"; do [[ "$a" == *=* ]] && export "${a?}"; done
+	n_claude="${N_CLAUDE:-3}" n_codex="${N_CODEX:-3}" n_deep="${N_DEEP:-0}" primeiro="${PRIMEIRO:-1}"
+	if [[ -n "$APP_SUBIR" ]] && ! { [[ -n "$APP_ATIVO" ]] && (cd "$RAIZ" && bash -c "$APP_ATIVO") >/dev/null 2>&1; }; then
+		echo "subindo o app: $APP_SUBIR"
+		(cd "$RAIZ" && bash -c "$APP_SUBIR")
+	fi
+	rm -f "$ESTADO/PAUSA"
+	python3 "$LIB/supervisor.py" config claude="$n_claude" codex="$n_codex" deep="$n_deep" primeiro="$primeiro" >/dev/null
+	read -r c x d a <<<"$(python3 "$LIB/supervisor.py" inicial "$n_claude" "$n_codex" "$n_deep")"
+	DEEP_N=$d ANALISTA_FERRAMENTA=$a "$LIB/abrir.sh" "$c" "$x" 1 "$primeiro"
+	servico_supervisor
+	[[ -n "$APP_URL" ]] && echo "App: $APP_URL"
+	;;
+agentes) exec "$LIB/abrir.sh" "$@" ;;
+painel)
+	(sleep 1; xdg-open "http://127.0.0.1:$PAINEL_PORTA" >/dev/null 2>&1 || true) &
+	if ss -ltnH "sport = :$PAINEL_PORTA" | grep -q .; then
+		echo "Painel da equipe já no ar: http://127.0.0.1:$PAINEL_PORTA"
+	else
+		exec python3 "$EQUIPE_HOME/painel/servidor.py" "$PAINEL_PORTA"
+	fi
+	;;
+supervisor) if [[ $# -eq 0 ]]; then servico_supervisor; else exec python3 "$LIB/supervisor.py" "$@"; fi ;;
+limites) exec python3 "$LIB/limites.py" "$@" ;;
+pausar) AGENTE="${AGENTE:-dono}" exec "$LIB/pausa.sh" pausar "${1:-pedido do dono}" ;;
+retomar) AGENTE="${AGENTE:-dono}" exec "$LIB/pausa.sh" retomar ;;
+pausa) exec "$LIB/pausa.sh" "${1:-ver}" "${@:2}" ;;
+parar)
+	for a in "$@"; do [[ "$a" == *=* ]] && export "${a?}"; done
+	AGENTE="${AGENTE:-dono}" exec "$LIB/parar.sh"
+	;;
+itens) exec python3 "$LIB/itens.py" "$@" ;;
+trava) exec "$LIB/trava.sh" "$@" ;;
+msg) exec "$LIB/msg.sh" "$@" ;;
+parada) exec "$LIB/parada.sh" "$@" ;;
+vivo) exec "$LIB/vivo.sh" "$@" ;;
+arvore) exec "$LIB/arvore.sh" "$@" ;;
+changelog) exec "$LIB/changelog.sh" "$@" ;;
+compactar) exec "$LIB/compactar.sh" "$@" ;;
+recuperar) exec "$LIB/recuperar.sh" "$@" ;;
+limpar-worktrees) exec "$LIB/limpar-worktrees.sh" "$@" ;;
+identidade) exec python3 "$LIB/identidade.py" "$@" ;;
+perguntas) exec python3 "$EQUIPE_HOME/painel/servidor.py" --perguntas ;;
+roteiro) exec python3 "$LIB/roteiro.py" "${1:?roteiro: faxina | varredura | pesquisa}" ;;
+faxina) exec python3 "$EQUIPE_HOME/roteiros/faxina.py" "$@" ;;
+*) echo "comando desconhecido: $cmd (equipe ajuda)" >&2; exit 2 ;;
+esac
